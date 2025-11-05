@@ -125,19 +125,106 @@ export default class HugoSyncPlugin extends Plugin {
 
   async syncFileToHugo(file: TFile) {
     const content = await this.app.vault.read(file);
-    
+
     const hugoContent = this.convertToHugoFormat(content, file.name);
-    
-    const hugoFilePath = path.join(this.settings.hugoPath, this.settings.contentPath, file.name);
+
+    const hugoDirPath = path.join(this.settings.hugoPath, this.settings.contentPath);
+    const hugoFilePath = path.join(hugoDirPath, file.name);
+
+    // 确保目录存在
+    if (!fs.existsSync(hugoDirPath)) {
+      fs.mkdirSync(hugoDirPath, { recursive: true });
+    }
+
     fs.writeFileSync(hugoFilePath, hugoContent);
   }
 
   convertToHugoFormat(content: string, fileName: string): string {
+    // 检测是否存在 YAML 前置元数据
+    const hasExistingYaml = content.startsWith('---') &&
+                           content.indexOf('---', 3) > 3;
+
+    if (hasExistingYaml) {
+      return this.adjustExistingYaml(content, fileName);
+    } else {
+      return this.createNewYaml(content, fileName);
+    }
+  }
+
+  adjustExistingYaml(content: string, fileName: string): string {
     const title = fileName.replace('.md', '');
     const date = new Date().toISOString();
-
     const tags: string[] = [];
 
+    // 提取现有 YAML 块（不包含结尾的 ---）
+    const firstYamlEnd = content.indexOf('---', 3);
+    const existingYaml = content.substring(0, firstYamlEnd);
+    const contentAfterYaml = content.substring(firstYamlEnd).trim();
+
+    // 解析现有 YAML 中的标签
+    const lines = existingYaml.split('\n');
+    let inTagsSection = false;
+
+    for (const line of lines) {
+      const trimmedLine = line.trim();
+
+      if (trimmedLine === 'tags:') {
+        inTagsSection = true;
+        continue;
+      }
+
+      if (inTagsSection) {
+        if (trimmedLine.startsWith('-')) {
+          const tag = trimmedLine.slice(1).trim().replace(/['"]/g, '');
+          if (tag && !tags.includes(tag)) {
+            tags.push(tag);
+          }
+        } else if (trimmedLine.startsWith('[') && trimmedLine.endsWith(']')) {
+          // 处理数组格式 tags: ["tag1", "tag2"]
+          const tagArray = trimmedLine.slice(1, -1).split(',');
+          for (const tag of tagArray) {
+            const cleanTag = tag.trim().replace(/['"]/g, '');
+            if (cleanTag && !tags.includes(cleanTag)) {
+              tags.push(cleanTag);
+            }
+          }
+        } else if (trimmedLine && !trimmedLine.startsWith(' ') && !trimmedLine.startsWith('\t')) {
+          // 遇到新的字段，结束标签解析
+          inTagsSection = false;
+        }
+      }
+    }
+
+    // 处理内容中的内联标签和标题过滤
+    const processedContent = this.processContentWithTagsAndFiltering(contentAfterYaml, tags);
+
+    // 解析现有 YAML，添加缺失字段
+    const adjustedYaml = this.adjustYamlFields(existingYaml, title, date, tags);
+
+    return adjustedYaml + '\n\n' + processedContent.join('\n').trim();
+  }
+
+  createNewYaml(content: string, fileName: string): string {
+    const title = fileName.replace('.md', '');
+    const date = new Date().toISOString();
+    const tags: string[] = [];
+
+    const processedContent = this.processContentWithTagsAndFiltering(content, tags);
+
+    // 创建 Hugo 格式的前置元数据
+    const hugoFrontMatter = `---
+title: "${title}"
+date: ${date}
+draft: false
+tags: [${tags.map(tag => `"${tag}"`).join(', ')}]
+---
+
+`;
+
+    return hugoFrontMatter + processedContent.join('\n').trim();
+  }
+
+  processContentWithTagsAndFiltering(content: string, tags: string[]): string[] {
     const lines = content.split('\n');
     let tagSection = false;
     let processedContent = [];
@@ -150,42 +237,42 @@ export default class HugoSyncPlugin extends Plugin {
       const line = lines[i];
       const trimmedLine = line.trim();
 
-      if (trimmedLine.startsWith('##')) {
+      if (trimmedLine.startsWith('#')) {
         const headerMatch = trimmedLine.match(/^(#+)\s*(.*)/);
         if (headerMatch) {
           const headerLevel = headerMatch[1].length;
           const headerContent = headerMatch[2];
-          
+
           if (headerLevel <= currentHeaderLevel) {
             skipContent = false;
           }
-          
+
           if (this.settings.filteredHeaders.includes(headerContent)) {
             skipContent = true;
             currentHeaderLevel = headerLevel;
             continue;
           }
-          
+
           currentHeaderLevel = headerLevel;
         }
       }
-    
+
       if (trimmedLine === 'tags:') {
         tagSection = true;
         continue;
       }
-    
+
       if (tagSection) {
         if (trimmedLine.startsWith('-')) {
           const tag = trimmedLine.slice(1).trim();
-          if (tag && !symbolOnlyRegex.test(tag)) {
+          if (tag && !symbolOnlyRegex.test(tag) && !tags.includes(tag)) {
             tags.push(tag);
           }
         } else {
           tagSection = false;
         }
       } else if (!skipContent) {
-        // New logic to handle standalone tags
+        // 处理内联标签
         const standaloneTagsMatch = trimmedLine.match(/#[^\s#]+/g);
         if (standaloneTagsMatch) {
           standaloneTagsMatch.forEach(tag => {
@@ -194,7 +281,7 @@ export default class HugoSyncPlugin extends Plugin {
               tags.push(cleanTag);
             }
           });
-          // Remove the standalone tags from the line
+          // 移除内联标签
           const cleanedLine = line.replace(/#[^\s#]+/g, '').trim();
           if (cleanedLine) {
             processedContent.push(cleanedLine);
@@ -204,20 +291,87 @@ export default class HugoSyncPlugin extends Plugin {
         }
       }
     }
-    // 创建 Hugo 格式的前置元数据
-    const hugoFrontMatter = `---
-title: "${title}"
-date: ${date}
-draft: false
-tags: [${tags.map(tag => `"${tag}"`).join(', ')}]
----
 
-`;
+    return processedContent;
+  }
 
-    // 组合处理后的内容
-    let cleanContent = processedContent.join('\n').trim();
+  adjustYamlFields(existingYaml: string, title: string, date: string, tags: string[]): string {
+    const lines = existingYaml.split('\n');
+    const result: string[] = [];
+    let hasTitle = false;
+    let hasDate = false;
+    let hasDraft = false;
+    let hasTags = false;
 
-    return hugoFrontMatter + cleanContent;
+    // 解析现有字段（跳过开头的 ---）
+    for (let i = 0; i < lines.length; i++) {
+      const line = lines[i];
+      const trimmedLine = line.trim();
+
+      // 跳过开头的 ---
+      if (trimmedLine === '---' && i === 0) {
+        result.push(line);
+        continue;
+      }
+
+      if (trimmedLine.startsWith('title:')) {
+        hasTitle = true;
+        result.push(line);
+      } else if (trimmedLine.startsWith('date:')) {
+        hasDate = true;
+        result.push(line);
+      } else if (trimmedLine.startsWith('draft:')) {
+        hasDraft = true;
+        result.push(line);
+      } else if (trimmedLine.startsWith('tags:')) {
+        hasTags = true;
+        // 处理现有标签并合并新标签
+        result.push(this.mergeTagsLine(line, tags));
+        i = lines.length - 1; // 跳过原有标签的其他行
+      } else if (trimmedLine.startsWith('-')) {
+        // 跳过原有标签的其他行
+        if (hasTags) continue;
+        result.push(line);
+      } else {
+        result.push(line);
+      }
+    }
+
+    // 添加缺失的字段
+    if (!hasTitle) result.push(`title: "${title}"`);
+    if (!hasDate) result.push(`date: ${date}`);
+    if (!hasDraft) result.push('draft: false');
+    if (!hasTags) result.push(`tags: [${tags.map(tag => `"${tag}"`).join(', ')}]`);
+
+    // 添加结尾的 ---
+    result.push('---');
+
+    return result.join('\n');
+  }
+
+  mergeTagsLine(existingTagsLine: string, newTags: string[]): string {
+    // 解析现有标签
+    const existingTags: string[] = [];
+    const trimmedLine = existingTagsLine.trim();
+
+    if (trimmedLine === 'tags:') {
+      // 格式: tags:，需要读取后续行
+      return `tags: [${newTags.map(tag => `"${tag}"`).join(', ')}]`;
+    } else if (trimmedLine.startsWith('tags: [') && trimmedLine.endsWith(']')) {
+      // 格式: tags: ["tag1", "tag2"]
+      const tagContent = trimmedLine.slice(7, -1);
+      const tagArray = tagContent.split(',');
+      for (const tag of tagArray) {
+        const cleanTag = tag.trim().replace(/['"]/g, '');
+        if (cleanTag && !existingTags.includes(cleanTag)) {
+          existingTags.push(cleanTag);
+        }
+      }
+    }
+
+    // 合并新旧标签
+    const allTags = [...new Set([...existingTags, ...newTags])];
+    return `tags: [${allTags.map(tag => `"${tag}"`).join(', ')}]`;
   }
 }
 
