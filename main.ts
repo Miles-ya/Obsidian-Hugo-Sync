@@ -475,7 +475,10 @@ tags: [${tags.map(tag => `"${tag}"`).join(', ')}]
     fs.copyFileSync(sourceImagePath, targetImagePath);
 
     // 返回相对路径（用于 Hugo 中的引用）
-    const relativePath = `/${this.settings.imageSubPath}/${articleName}/${imageFile.name}`;
+    // 只对文件名中的空格进行 URL 编码，文件夹名保持原样
+    const encodedImageName = encodeURIComponent(imageFile.name);
+    const relativePath = `../../${this.settings.imageSubPath}/${articleName}/${encodedImageName}`;
+    console.log(`Generated image path: ${relativePath}`);
     return relativePath;
   }
 
